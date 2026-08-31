@@ -1,0 +1,388 @@
+# 2D plane-stress stiffness-ratio model.
+# The same modelling procedure was used for R = 1, 2, 5 and 10,
+# with the stiffness ratio and corresponding job/output names changed between runs.
+
+
+from abaqus import *
+from abaqusConstants import *
+from symbolicConstants import *
+import numpy as np
+import regionToolset
+import assembly
+import part
+import material
+import section
+import interaction
+import step
+import load
+import mesh
+import os
+
+
+
+SEED = 42
+rng = np.random.default_rng(SEED)
+
+# 0. MODEL PARAMETERS
+model_name = 'Model-1'
+
+patch_size = 300.0
+patch_area = patch_size**2
+
+target_density = 0.00121
+N_target = int(target_density * patch_area)
+
+sigma_log = 0.4
+target_area_fraction = 0.60
+mean_area_needed = target_area_fraction / target_density
+median_area = mean_area_needed / np.exp(0.5 * sigma_log**2)
+
+min_gap = 0.1
+max_attempts = 200000
+
+# Material parameters
+# Units: N/mm^2
+# Gel / matrix shear modulus: 500 Pa = 0.0005 N/mm^2
+# Neo-Hookean relation: C10 = mu0 / 2
+mu_matrix = 0.0005
+C10matrix = mu_matrix / 2.0
+
+stiffness_ratio = 2.0
+C10particles = C10matrix * stiffness_ratio
+
+D1matrix = 0.0
+D1particles = 0.0
+
+elCode1 = CPS4
+elCode2 = CPS3
+
+seedSize = 1.0
+vertDispl = -30.0
+
+job_name = 'Job-CPS-100-ratio2'
+output_name = 'results_CPS_100_ratio2.txt'
+
+# 1. PARTICLE SIZE AND PLACEMENT
+areas = rng.lognormal(
+    mean=np.log(median_area),
+    sigma=sigma_log,
+    size=N_target
+)
+
+radii = np.sqrt(areas / np.pi)
+
+positions = []
+
+for r in radii:
+    placed = False
+    attempts = 0
+
+    while not placed and attempts < max_attempts:
+        x = rng.uniform(r, patch_size - r)
+        y = rng.uniform(r, patch_size - r)
+
+        overlap = False
+
+        for (xp, yp, rp) in positions:
+            dx = x - xp
+            dy = y - yp
+
+            if dx*dx + dy*dy < (r + rp + min_gap)**2:
+                overlap = True
+                break
+
+        if not overlap:
+            positions.append((x, y, r))
+            placed = True
+
+        attempts += 1
+
+# 2. GEOMETRY CREATION
+mdb.Model(name=model_name, modelType=STANDARD_EXPLICIT)
+
+s = mdb.models[model_name].ConstrainedSketch(
+    name='__profile__',
+    sheetSize=10 * patch_size
+)
+
+s.rectangle(point1=(0.0, 0.0), point2=(patch_size, patch_size))
+
+for x, y, r in positions:
+    if (
+        x <= r + min_gap or
+        x >= (patch_size - r - min_gap) or
+        y <= r + min_gap or
+        y >= (patch_size - r - min_gap)
+    ):
+        continue
+
+    s.CircleByCenterPerimeter(
+        center=(x, y),
+        point1=(x + r, y)
+    )
+
+p_matrix = mdb.models[model_name].Part(
+    name='Matrix',
+    dimensionality=TWO_D_PLANAR,
+    type=DEFORMABLE_BODY
+)
+
+p_matrix.BaseShell(sketch=s)
+
+s2 = mdb.models[model_name].ConstrainedSketch(
+    name='__profile__',
+    sheetSize=10 * patch_size
+)
+
+for x, y, r in positions:
+    if (
+        x <= r + min_gap or
+        x >= (patch_size - r - min_gap) or
+        y <= r + min_gap or
+        y >= (patch_size - r - min_gap)
+    ):
+        continue
+
+    s2.CircleByCenterPerimeter(
+        center=(x, y),
+        point1=(x + r, y)
+    )
+
+p_particles = mdb.models[model_name].Part(
+    name='Particles',
+    dimensionality=TWO_D_PLANAR,
+    type=DEFORMABLE_BODY
+)
+
+p_particles.BaseShell(sketch=s2)
+
+# 3. MATERIAL AND SECTION ASSIGNMENTS
+mdb.models[model_name].Material(name='Matrix')
+
+mdb.models[model_name].materials['Matrix'].Hyperelastic(
+    materialType=ISOTROPIC,
+    testData=OFF,
+    type=NEO_HOOKE,
+    volumetricResponse=VOLUMETRIC_DATA,
+    table=((C10matrix, D1matrix), )
+)
+
+mdb.models[model_name].Material(name='Particles')
+
+mdb.models[model_name].materials['Particles'].Hyperelastic(
+    materialType=ISOTROPIC,
+    testData=OFF,
+    type=NEO_HOOKE,
+    volumetricResponse=VOLUMETRIC_DATA,
+    table=((C10particles, D1particles), )
+)
+
+mdb.models[model_name].HomogeneousSolidSection(
+    name='Matrix_Section',
+    material='Matrix',
+    thickness=None
+)
+
+mdb.models[model_name].HomogeneousSolidSection(
+    name='Particle_Section',
+    material='Particles',
+    thickness=None
+)
+
+p_matrix.SectionAssignment(
+    region=regionToolset.Region(faces=p_matrix.faces[:]),
+    sectionName='Matrix_Section'
+)
+
+p_particles.SectionAssignment(
+    region=regionToolset.Region(faces=p_particles.faces[:]),
+    sectionName='Particle_Section'
+)
+
+# 4. ASSEMBLY AND STEP
+a = mdb.models[model_name].rootAssembly
+
+a.Instance(
+    name='Matrix-1',
+    part=p_matrix,
+    dependent=ON
+)
+
+a.Instance(
+    name='Particles-1',
+    part=p_particles,
+    dependent=ON
+)
+
+mdb.models[model_name].StaticStep(
+    name='Compression_Step',
+    previous='Initial',
+    nlgeom=ON,
+    initialInc=0.001,
+    minInc=1e-08
+)
+
+# Field output request: includes NE strain output
+if 'F-Output-1' in mdb.models[model_name].fieldOutputRequests.keys():
+    del mdb.models[model_name].fieldOutputRequests['F-Output-1']
+
+mdb.models[model_name].FieldOutputRequest(
+    name='F-Output-1',
+    createStepName='Compression_Step',
+    variables=('U', 'RF', 'S', 'NE'),
+    numIntervals=20
+)
+
+# 5. INTERACTION
+mdb.models[model_name].ContactProperty('IntProp-1')
+
+mdb.models[model_name].interactionProperties['IntProp-1'].TangentialBehavior(
+    formulation=ROUGH
+)
+
+mdb.models[model_name].interactionProperties['IntProp-1'].NormalBehavior(
+    pressureOverclosure=HARD,
+    allowSeparation=OFF,
+    constraintEnforcementMethod=DEFAULT
+)
+
+s1 = a.instances['Matrix-1'].edges
+region1 = a.Surface(side1Edges=s1, name='m_Surf')
+
+s2 = a.instances['Particles-1'].edges
+region2 = a.Surface(side1Edges=s2, name='s_Surf')
+
+mdb.models[model_name].SurfaceToSurfaceContactStd(
+    name='Int-1',
+    createStepName='Initial',
+    main=region1,
+    secondary=region2,
+    sliding=FINITE,
+    interactionProperty='IntProp-1'
+)
+
+# 6. MESHING
+elemType1 = mesh.ElemType(
+    elemCode=elCode1,
+    elemLibrary=STANDARD
+)
+
+elemType2 = mesh.ElemType(
+    elemCode=elCode2,
+    elemLibrary=STANDARD
+)
+
+p_matrix.setElementType(
+    regions=(p_matrix.faces[:],),
+    elemTypes=(elemType1, elemType2)
+)
+
+p_particles.setElementType(
+    regions=(p_particles.faces[:],),
+    elemTypes=(elemType1, elemType2)
+)
+
+p_matrix.seedPart(size=seedSize)
+p_matrix.generateMesh()
+
+p_particles.seedPart(size=seedSize)
+p_particles.generateMesh()
+
+# 7. BOUNDARY CONDITIONS
+e1 = a.instances['Matrix-1'].edges
+
+# Fix bottom edge vertically
+bottom_edge = e1.findAt(((patch_size / 2.0, 0.0, 0.0), ))
+
+a.Set(
+    edges=bottom_edge,
+    name='Set_Bottom_FixU2'
+)
+
+mdb.models[model_name].DisplacementBC(
+    name='Fix_Bottom_U2',
+    createStepName='Initial',
+    region=a.sets['Set_Bottom_FixU2'],
+    u2=SET
+)
+
+# Fix one bottom vertex horizontally to prevent rigid body translation.
+# This follows the vertex selection method Marco used.
+v1 = a.instances['Matrix-1'].vertices
+verts1 = v1.getSequenceFromMask(mask=('[#100 ]', ), )
+
+region = a.Set(
+    vertices=verts1,
+    name='Set_Bottom_FixU1'
+)
+
+mdb.models[model_name].DisplacementBC(
+    name='Fix_Bottom_U1',
+    createStepName='Initial',
+    region=region,
+    u1=SET
+)
+
+# Apply compression on top edge
+top_edge = e1.findAt(((patch_size / 2.0, patch_size, 0.0), ))
+
+a.Set(
+    edges=top_edge,
+    name='Set_Top_Load'
+)
+
+mdb.models[model_name].DisplacementBC(
+    name='Apply_Compression',
+    createStepName='Compression_Step',
+    region=a.sets['Set_Top_Load'],
+    u2=vertDispl
+)
+
+# 8. JOB SUBMISSION
+mdb.Job(
+    name=job_name,
+    model=model_name,
+    type=ANALYSIS,
+    resultsFormat=ODB
+)
+
+mdb.jobs[job_name].submit(consistencyChecking=OFF)
+mdb.jobs[job_name].waitForCompletion()
+
+# 9. DATA EXTRACTION
+from odbAccess import *
+
+odb_path = job_name + '.odb'
+
+if os.path.exists(odb_path):
+    odb = openOdb(path=odb_path)
+
+    step = odb.steps['Compression_Step']
+
+    output = open(output_name, 'w')
+    output.write('Time, Displacement, Force\n')
+
+    sets = odb.rootAssembly.nodeSets.keys()
+    actual_set_name = 'SET_TOP_LOAD' if 'SET_TOP_LOAD' in sets else 'Set_Top_Load'
+    target_set = odb.rootAssembly.nodeSets[actual_set_name]
+
+    for frame in step.frames:
+        time = frame.frameValue
+
+        u_subset = frame.fieldOutputs['U'].getSubset(region=target_set)
+        rf_subset = frame.fieldOutputs['RF'].getSubset(region=target_set)
+
+        total_force = sum([v.data[1] for v in rf_subset.values])
+        disp = u_subset.values[0].data[1] if u_subset.values else 0.0
+
+        output.write('%f, %f, %f\n' % (
+            time,
+            disp,
+            total_force
+        ))
+
+    output.close()
+    odb.close()
+
+else:
+    raise RuntimeError('ODB file was not found: ' + odb_path)
